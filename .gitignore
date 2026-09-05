@@ -1,0 +1,5 @@
+# 内部记忆 / 会话数据（绝不发布）
+.workbuddy/
+
+# macOS
+.DS_Store
