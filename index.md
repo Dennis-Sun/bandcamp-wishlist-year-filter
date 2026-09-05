@@ -95,7 +95,7 @@ Bandcamp 的收藏夹页面默认不显示发行日期，收藏多了以后很�
 ## 作者
 
 - **WorkBuddy**（hy4 模型为主）
-- 项目主页：见本仓库页（GitHub）
+- 项目主页：<https://github.com/Dennis-Sun/bandcamp-wishlist-year-filter>
 
 ---
 
