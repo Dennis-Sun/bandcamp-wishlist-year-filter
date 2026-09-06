@@ -2,7 +2,7 @@
 // @name         Bandcamp Wishlist Year Filter
 // @name:zh-CN   Bandcamp 收藏夹年份过滤器
 // @namespace    https://bandcamp.com/
-// @version      1.3.3
+// @version      1.3.4
 // @description  Add a release-year filter next to the wishlist search box on Bandcamp wishlist pages
 // @description:zh-CN  在 Bandcamp 收藏夹（wishlist）页面搜索框右侧添加「发行年份」过滤器
 // @author       WorkBuddy
@@ -47,6 +47,14 @@
  *     现在选中年份后会比对「缓存里该区间的条目数」与「页面已渲染的匹配数」，
  *     不足时自动触发页面的 view all / 滚动懒加载把条目加载出来；新 li 的年份
  *     直接从 store.data 回填（已解析过的不产生网络请求）。
+ * 4e. v1.3.4 起：修复 v1.3.3 引入的「view all 加载不出结果 + 控制台报
+ *     e.completeCallback is not a function」。
+ *     根因：v1.3.3 的 applyFilter 用 display:none 把非选中 li 全部隐藏，
+ *     Bandcamp 的 view all ajax 在完成回调里基于 jQuery :visible 扫描已渲染条目，
+ *     发现「全部不可见」时走到 reject 分支但 completeCallback 未设 → 抛错。
+ *     修法：autoLoad 期间用 rootEl 的 visibility:hidden 整体隐藏（li 的 display
+ *     仍为 block，Bandcamp 的 :visible 仍能选到），同时 applyFilter 顶部加
+ *     autoLoad.running 守卫短路所有路径的隐藏；加载完毕由 finally 一次性 applyFilter。
  * 5. 所有出站请求统一经过限流器（默认 2 次/秒 + 滑动窗口）；一旦收到 429 就整体冷却，
  *    按 8s→16s→…→120s 指数退避（优先采用响应头的 Retry-After），冷却期间状态栏倒计时提示，
  *    冷却结束后自动重试。被限流导致失败的条目不会写入缓存，避免被永久误判为「无年份」。
@@ -1092,6 +1100,12 @@
   }
 
   function applyFilter() {
+    // 自动加载期间不隐藏 li：Bandcamp 的 view all ajax 完成回调基于 jQuery :visible
+    // 扫描已渲染条目，若我们用 display:none 把非选中 li 全部隐藏，
+    // Bandcamp 会以为"已加载完"走到 reject 分支但 completeCallback 未设，
+    // 抛 "e.completeCallback is not a function"。加载完毕后由 autoExpandForFilter
+    // 的 finally 一次性 applyFilter。
+    if (autoLoad && autoLoad.running) return;
     if (!items.size) return;
     const [from, to] = getRange();
     let shown = 0;
@@ -1220,11 +1234,22 @@
     autoLoad.stalled = 0;
     log('所选年份在页面尚未全部渲染，自动加载条目：', have, '/', want);
 
+    // 关键修复：先把过滤隐藏的 li 全部恢复显示，再用 rootEl 整体 visibility:hidden
+    // 让用户看不到"一闪而过"，但 li 的 display 仍是 block，Bandcamp 的 :visible
+    // 选择器能正常扫描到条目，view all 的 ajax 完成回调不会走 reject 错分支。
+    const restoreLoading = rootEl && !rootEl.classList.contains('bc-yf-loading');
+    if (restoreLoading) rootEl.classList.add('bc-yf-loading');
+    const hiddenLis = rootEl
+      ? Array.from(rootEl.querySelectorAll(CFG.itemSelector + '.bc-yf-hidden'))
+      : [];
+    if (hiddenLis.length) hiddenLis.forEach(li => li.classList.remove('bc-yf-hidden'));
+
     try {
       if (clickViewAll()) {
         await sleep(CFG.autoLoadRoundDelay);
         if (rootEl) scan(rootEl);
-        applyFilter();
+        // 注意：这里不调 applyFilter()——autoLoad.running 期间 applyFilter 已被短路，
+        // 等加载完由 finally 一次性应用过滤。
       }
 
       let lastCount = items.size;
@@ -1235,7 +1260,6 @@
         scrollToBottom();                         // 触发懒加载
         await sleep(CFG.autoLoadRoundDelay);
         if (rootEl) scan(rootEl);
-        applyFilter();
         autoLoad.loaded = countInDom(from, to);
         renderStatus();
 
@@ -1254,7 +1278,10 @@
     } catch (e) {
       log('自动加载条目出错：', e && e.message);
     } finally {
-      autoLoad.running = false;
+      // 加载结束：先移除整体隐藏，再一次 applyFilter 把非选中 li 隐藏回去
+      if (restoreLoading && rootEl) rootEl.classList.remove('bc-yf-loading');
+      autoLoad.running = false;                    // 必须先复位，否则 applyFilter 仍被短路
+      applyFilter();
       renderStatus();
     }
   }
@@ -1366,6 +1393,8 @@
       .bc-year-filter button:hover{background:rgba(128,128,128,.28);}
       .bc-year-filter .bc-yf-status{margin-left:4px;font-size:12px;opacity:.65;font-variant-numeric:tabular-nums;}
       li.collection-item-container.bc-yf-hidden{display:none !important;}
+      /* 自动加载期间整体隐藏（visibility 而非 display），让 Bandcamp 的 :visible 仍能选到 li */
+      .bc-yf-loading{visibility:hidden !important;}
       .bc-year-badge{position:absolute;right:4px;bottom:4px;padding:1px 5px;border-radius:3px;
         font-size:11px;line-height:1.5;background:rgba(0,0,0,.68);color:#fff;
         pointer-events:none;z-index:3;letter-spacing:.02em;}

@@ -56,10 +56,11 @@ Bandcamp 的收藏夹页面默认不显示发行日期，收藏多了以后很�
 
 ### 版本
 
-当前版本 **v1.3.3**。
+当前版本 **v1.3.4**。
 
 ### 版本日志
 
+- **v1.3.4**（2026-09）：修复 v1.3.3 引入的「view all 加载不出结果 + 控制台报 `e.completeCallback is not a function`」。根因：v1.3.3 的 `applyFilter` 用 `display:none` 把非选中 li 全部隐藏，Bandcamp 的 view all ajax 完成回调基于 jQuery `:visible` 扫描已渲染条目时发现"全部不可见"，走到 reject 分支但 `completeCallback` 未设 → 抛错。修法：autoLoad 期间用 rootEl 的 `visibility:hidden` 整体隐藏（li 的 display 仍为 block，Bandcamp 的 `:visible` 仍能选到），`applyFilter` 顶部加 `autoLoad.running` 守卫短路所有路径的隐藏；加载完毕由 `finally` 一次性 `applyFilter`。
 - **v1.3.3**（2026-09）：修复「切到非最晚年份后页面为空」——脚本检测到所选年份在 DOM 里没渲染全时，会自动触发 Bandcamp 自带的「view all + 滚动懒加载」把剩余 li 拉进 DOM，原解析缓存即时落到新条目上，无需额外网络请求。
 - **v1.3.2**：发行年份下拉菜单改为从全库解析缓存 `store.data` 取值，而不仅是当前 DOM 中的 20 张专辑；自此刷新页面后台也能持续推进。
 - **v1.3.1** 起加上自愈、watchdog 与「重建清单」按钮，稳固大列表场景。
