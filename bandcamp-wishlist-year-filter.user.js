@@ -2,7 +2,7 @@
 // @name         Bandcamp Wishlist Year Filter
 // @name:zh-CN   Bandcamp 收藏夹年份过滤器
 // @namespace    https://bandcamp.com/
-// @version      1.3.8
+// @version      1.3.9
 // @description  Add a release-year filter next to the wishlist search box on Bandcamp wishlist pages
 // @description:zh-CN  在 Bandcamp 收藏夹（wishlist）页面搜索框右侧添加「发行年份」过滤器
 // @author       WorkBuddy
@@ -84,6 +84,17 @@
  *     修法：bc-yf-hidden 改用「height:0 + opacity:0 + overflow:hidden」，
  *     用户看不到、不占布局空间，但 offsetWidth 仍 > 0，:visible 照常匹配，
  *     Bandcamp 的加载回调不再走错分支。
+ * 4j. v1.3.9 起：三处交互/体验修正。
+ *     - 过滤隐藏改用 position:absolute 移出视口（而非 v1.3.8 的 height:0）。
+ *       Bandcamp 的条目容器是 grid/flex 布局，height:0 的 li 仍占一个网格
+ *       单元格，下拉时会留下大量空白；absolute 让它脱离文档流、其余 li 自然
+ *       补位相邻排布，同时 offsetWidth 仍 > 0，:visible 照常匹配不触发报错。
+ *     - 新增 syncAutoLoadProgress()：MutationObserver 捕获到新条目后重算
+ *       「已显示 x/y」，用户手动下拉加载时状态栏数字实时变化，不再卡旧值。
+ *     - 新增 autoLoad.viewAllGone：view all 按钮消失后不再提示用户去点它，
+ *       改为「已显示 x/y 张（页面已无可加载条目）」。
+ *     - 工具栏按钮更名：「清除缓存」→「清除年份」，与「重建清单」区分开——
+ *       前者只清年份缓存（清单保留），后者只清条目清单（年份保留），互补而非包含。
  * 5. 所有出站请求统一经过限流器（默认 2 次/秒 + 滑动窗口）；一旦收到 429 就整体冷却，
  *    按 8s→16s→…→120s 指数退避（优先采用响应头的 Retry-After），冷却期间状态栏倒计时提示，
  *    冷却结束后自动重试。被限流导致失败的条目不会写入缓存，避免被永久误判为「无年份」。
@@ -1183,7 +1194,8 @@
     loaded: 0,    // 当前 DOM 中已渲染且匹配区间的条目数
     rounds: 0,
     stalled: 0,
-    degraded: false  // 检测到 Bandcamp completeCallback 报错后降级为纯监听模式
+    degraded: false,   // 检测到 Bandcamp completeCallback 报错后降级为纯监听模式
+    viewAllGone: false // 页面上「view all」按钮已消失 → 没有更多条目可加载
   };
 
   // 全局错误监听：捕获 Bandcamp view all ajax 的 completeCallback 报错，
@@ -1380,6 +1392,8 @@
       // 加载结束：先移除整体隐藏，再一次 applyFilter 把非选中 li 隐藏回去
       if (restoreLoading && rootEl) rootEl.classList.remove('bc-yf-loading');
       autoLoad.running = false;                    // 必须先复位，否则 applyFilter 仍被短路
+      // 记录「view all」是否还在：按钮已消失就不再提示用户去点它
+      autoLoad.viewAllGone = !findViewAllEl();
       applyFilter();
       renderStatus();
     }
@@ -1437,9 +1451,18 @@
       }
       ui.status.style.opacity = '1';
     } else if (autoLoad.want && autoLoad.loaded < autoLoad.want) {
-      // 加载结束仍不够：告诉用户剩下的要手动点 view all（Bandcamp 自身限制）
-      parts.push(`该年份 ${autoLoad.loaded}/${autoLoad.want} 张已在页面，其余请点「view all」`);
-      ui.status.title = '页面没有渲染出全部条目，点 Bandcamp 的「view all」后会自动补上';
+      // 加载结束仍不够（Bandcamp 没把该年份的条目全部渲染出来）。
+      // 计数由 syncAutoLoadProgress() 在每次新条目插入时刷新，
+      // 所以用户手动下拉加载时这个 x/y 会实时变化，不会卡在旧值。
+      // viewAllGone：view all 按钮已消失（Bandcamp 认为没有更多可加载），
+      // 此时再让用户点它就无意义了，改提示为「已全部加载」。
+      if (autoLoad.viewAllGone) {
+        parts.push(`已显示 ${autoLoad.loaded}/${autoLoad.want} 张（页面已无可加载条目）`);
+        ui.status.title = 'Bandcamp 的「view all」已消失，当前页面没有更多条目可加载';
+      } else {
+        parts.push(`已显示 ${autoLoad.loaded}/${autoLoad.want} 张，下拉或点「view all」加载更多`);
+        ui.status.title = '页面还没渲染出该年份的全部条目，继续下拉或点 Bandcamp 的「view all」会自动补上';
+      }
     }
     ui.status.textContent = parts.join(' · ');
   }
@@ -1496,19 +1519,18 @@
         border:1px solid rgba(128,128,128,.55);background:rgba(128,128,128,.14);color:inherit;}
       .bc-year-filter button:hover{background:rgba(128,128,128,.28);}
       .bc-year-filter .bc-yf-status{margin-left:4px;font-size:12px;opacity:.65;font-variant-numeric:tabular-nums;}
-      /* 必须用「高度归零 + opacity:0」而不是 display:none！
-         Bandcamp 的 view all / 滚动分页 ajax 完成回调会用 jQuery :visible
-         扫描已渲染条目；一旦用 display:none 把 li 全部隐藏，
-         offsetWidth 变 0 → :visible 选不到 → handler 走 reject 分支但
-         completeCallback 未设 → 抛 "e.completeCallback is not a function"。
-         高度归零不占布局空间，但 offsetWidth 仍 > 0，:visible 照常匹配。 */
+      /* 隐藏被过滤的 li：两个约束必须同时满足
+         1) 不能用 display:none —— Bandcamp 的 view all / 分页 ajax 完成回调用
+            jQuery :visible（offsetWidth>0）扫描已渲染条目，全部不可见时会走
+            reject 分支且 completeCallback 未设 → 抛 e.completeCallback is not a function；
+         2) 也不能只靠 height:0 —— Bandcamp 的条目容器是 grid/flex 布局，
+            height:0 的 li 仍占一个网格单元格，会在下拉时留下大量空白。
+         解法：position:absolute 让它彻底脱离文档流（不再占网格位，其它 li 会
+         自然补位、相邻排布），再移到视口外 + opacity:0 让用户看不见；
+         绝对定位元素的 offsetWidth 仍 > 0，:visible 照常匹配，不触发(1)的报错。 */
       li.collection-item-container.bc-yf-hidden{
-        height:0 !important;min-height:0 !important;max-height:0 !important;
-        overflow:hidden !important;opacity:0 !important;
-        padding-top:0 !important;padding-bottom:0 !important;
-        margin-top:0 !important;margin-bottom:0 !important;
-        border-top-width:0 !important;border-bottom-width:0 !important;
-        pointer-events:none !important;}
+        position:absolute !important;left:-99999px !important;top:0 !important;
+        opacity:0 !important;pointer-events:none !important;z-index:-1 !important;}
       /* 自动加载期间整体隐藏（visibility 而非 display），让 Bandcamp 的 :visible 仍能选到 li */
       .bc-yf-loading{visibility:hidden !important;}
       .bc-year-badge{position:absolute;right:4px;bottom:4px;padding:1px 5px;border-radius:3px;
@@ -1569,8 +1591,12 @@
       '<span class="bc-yf-dash">–</span>' +
       '<select class="bc-yf-to" title="结束年份（含）"></select>' +
       '<button type="button" class="bc-yf-reset">重置</button>' +
-      '<button type="button" class="bc-yf-clear" title="清除当前账号已缓存的年份数据并重新解析">清除缓存</button>' +
-      '<button type="button" class="bc-yf-rebuild" title="丢弃已缓存的条目清单，重新从 Bandcamp 拉取完整列表">重建清单</button>' +
+      // 两个按钮清的是**不同**的东西，命名必须让差异一目了然：
+      //   清除年份 = 只清 store.data（年份缓存），条目清单保留 → 重新联网解析年份
+      //   重建清单 = 只清 roster（条目清单），年份缓存保留 → 重新拉取列表
+      // 二者互补而非包含关系：解析错了用「清除年份」，清单卡住/不全用「重建清单」。
+      '<button type="button" class="bc-yf-clear" title="只清除已解析的年份缓存并重新联网解析（条目清单保留）">清除年份</button>' +
+      '<button type="button" class="bc-yf-rebuild" title="只丢弃条目清单并重新从 Bandcamp 拉取完整列表（已解析的年份保留）">重建清单</button>' +
       '<span class="bc-yf-status"></span>';
 
     anchor.appendChild(wrap);
@@ -1717,9 +1743,29 @@
       if (dirty) {
         refreshYearOptions();
         applyFilter();
+        // 用户手动下拉滚动加载出新条目后，同步刷新「该年份 x/y」的计数，
+        // 否则状态栏里那个数字会一直卡在自动加载结束时的旧值不变化。
+        syncAutoLoadProgress();
       }
     });
     mo.observe(grid, { childList: true, subtree: true });
+  }
+
+  // 重新统计当前页面里落在所选区间的条目数，并刷新状态栏。
+  // 供 MutationObserver（手动下拉加载）与 rescan 兜底调用。
+  function syncAutoLoadProgress() {
+    if (!autoLoad.want) return;              // 没选年份 / 没有待补全的目标
+    if (autoLoad.running) return;            // 自动加载循环自己会更新
+    const [from, to] = getRange();
+    if (from == null && to == null) return;
+    const now = countInDom(from, to);
+    if (now !== autoLoad.loaded) {
+      autoLoad.loaded = now;
+      // 条目数变了说明刚加载了一批，顺便确认「view all」是否还在
+      // （按钮消失即代表 Bandcamp 认为没有更多条目可加载）
+      autoLoad.viewAllGone = !findViewAllEl();
+      renderStatus();
+    }
   }
 
   /* ============================ 启动 ============================ */
