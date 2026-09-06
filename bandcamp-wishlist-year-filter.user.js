@@ -2,7 +2,7 @@
 // @name         Bandcamp Wishlist Year Filter
 // @name:zh-CN   Bandcamp 收藏夹年份过滤器
 // @namespace    https://bandcamp.com/
-// @version      1.3.6
+// @version      1.3.7
 // @description  Add a release-year filter next to the wishlist search box on Bandcamp wishlist pages
 // @description:zh-CN  在 Bandcamp 收藏夹（wishlist）页面搜索框右侧添加「发行年份」过滤器
 // @author       WorkBuddy
@@ -68,6 +68,14 @@
  *     event.target 不对，handler 走错分支 reject Deferred 但 completeCallback
  *     未设 → 抛 "e.completeCallback is not a function"。修法：找到容器后
  *     继续 querySelector('button, a, [role="button"]') 返回内部可点击元素。
+ * 4h. v1.3.7 起：停止在自动加载循环里 scrollToBottom()（真正的报错来源）。
+ *     实测错误栈显示 ajax 由 n.onScroll → n.paginate → getItems 触发：
+ *     Bandcamp 的 view all 点击后会自己按分页加载完剩余条目，我们若再强行
+ *     滚动到底，会额外触发一次 scroll 分页，两条异步加载流打架，
+ *     ajax 完成后 reject Deferred 但 completeCallback 未设 → 抛同样的错。
+ *     修法：循环里只 sleep + scan + 计数，不再滚动，让 view all 自己加载完。
+ *     scrollToBottom 保留为工具函数但不再调用；autoLoadStableRounds 3→8，
+ *     避免 Bandcamp 分页间隔被误判为停滞。
  * 5. 所有出站请求统一经过限流器（默认 2 次/秒 + 滑动窗口）；一旦收到 429 就整体冷却，
  *    按 8s→16s→…→120s 指数退避（优先采用响应头的 Retry-After），冷却期间状态栏倒计时提示，
  *    冷却结束后自动重试。被限流导致失败的条目不会写入缓存，避免被永久误判为「无年份」。
@@ -112,7 +120,8 @@
     autoLoadOnFilter: true,              // 选中年份后自动把未渲染的条目加载出来
     autoLoadMaxRounds: 40,               // 自动加载最多循环几轮
     autoLoadRoundDelay: 700,             // 每轮等待多久让 Bandcamp 渲染(ms)
-    autoLoadStableRounds: 3              // 连续几轮条目数没增长就判定加载完毕
+    autoLoadStableRounds: 8              // 连续几轮条目数没增长就判定加载完毕
+                                         // （Bandcamp 分页加载有间隔，太小会误判停滞）
   };
 
   const TAG = '[BC-YearFilter]';
@@ -1272,6 +1281,11 @@
     }
   }
 
+  // 注意：这个函数**不再被 autoExpandForFilter 调用**。
+  // 强行滚动到底会触发 Bandcamp 的 n.onScroll → n.paginate → getItems → ajax，
+  // 与 view all 自己的分页加载流打架，ajax 完成后 reject Deferred 但
+  // completeCallback 未设 → 抛 "e.completeCallback is not a function"。
+  // 保留在此仅供将来需要手动触发懒加载时使用（务必先确认不会与 view all 并发）。
   function scrollToBottom() {
     try {
       if (doc.body) W.scrollTo(0, doc.body.scrollHeight);
@@ -1328,7 +1342,12 @@
         if (autoLoad.cancelled) break;
         autoLoad.rounds++;
 
-        scrollToBottom();                         // 触发懒加载
+        // 注意：这里**不能**调 scrollToBottom()！
+        // Bandcamp 的 view all 点击后会自己按分页加载完剩余条目；我们若再强行
+        // 滚动到底，会触发 Bandcamp 的 n.onScroll → n.paginate → getItems → ajax，
+        // 与 view all 自己的加载流打架，ajax 完成后 reject Deferred 但
+        // completeCallback 未设 → 抛 "e.completeCallback is not a function"。
+        // 实测错误栈正是：onScroll → paginate → getItems → ajax → XMLHttpRequest.send
         await sleep(CFG.autoLoadRoundDelay);
         if (rootEl) scan(rootEl);
         autoLoad.loaded = countInDom(from, to);
