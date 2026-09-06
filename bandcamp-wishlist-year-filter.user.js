@@ -2,7 +2,7 @@
 // @name         Bandcamp Wishlist Year Filter
 // @name:zh-CN   Bandcamp 收藏夹年份过滤器
 // @namespace    https://bandcamp.com/
-// @version      1.3.4
+// @version      1.3.5
 // @description  Add a release-year filter next to the wishlist search box on Bandcamp wishlist pages
 // @description:zh-CN  在 Bandcamp 收藏夹（wishlist）页面搜索框右侧添加「发行年份」过滤器
 // @author       WorkBuddy
@@ -55,6 +55,13 @@
  *     修法：autoLoad 期间用 rootEl 的 visibility:hidden 整体隐藏（li 的 display
  *     仍为 block，Bandcamp 的 :visible 仍能选到），同时 applyFilter 顶部加
  *     autoLoad.running 守卫短路所有路径的隐藏；加载完毕由 finally 一次性 applyFilter。
+ * 4f. v1.3.5 起：view all 触发方式加固 + 报错自动降级。
+ *     - clickViewAll 优先用 jQuery trigger（Bandcamp 的绑定多在 jQuery 上），
+ *       其次 dispatchEvent 模拟完整鼠标序列（mousedown→mouseup→click），
+ *       最后才 fallback 到原生 el.click()。
+ *     - findViewAllEl 增加调试日志，输出找到的元素 tag/class/id/text 便于诊断。
+ *     - 全局 error 监听捕获 completeCallback 报错后自动降级为「手动模式」：
+ *       不再自动点 view all，状态栏提示用户手动点击，避免反复报错。
  * 5. 所有出站请求统一经过限流器（默认 2 次/秒 + 滑动窗口）；一旦收到 429 就整体冷却，
  *    按 8s→16s→…→120s 指数退避（优先采用响应头的 Retry-After），冷却期间状态栏倒计时提示，
  *    冷却结束后自动重试。被限流导致失败的条目不会写入缓存，避免被永久误判为「无年份」。
@@ -1152,8 +1159,23 @@
     want: 0,      // 缓存里该区间应有的条目数
     loaded: 0,    // 当前 DOM 中已渲染且匹配区间的条目数
     rounds: 0,
-    stalled: 0
+    stalled: 0,
+    degraded: false  // 检测到 Bandcamp completeCallback 报错后降级为纯监听模式
   };
+
+  // 全局错误监听：捕获 Bandcamp view all ajax 的 completeCallback 报错，
+  // 自动降级为纯监听模式（不再自动点 view all，只提示用户手动点击），避免反复报错。
+  if (W.addEventListener) {
+    W.addEventListener('error', (ev) => {
+      const msg = (ev && ev.message) || '';
+      if (msg.indexOf('completeCallback') !== -1 && !autoLoad.degraded) {
+        autoLoad.degraded = true;
+        log('检测到 Bandcamp view all ajax 报错（completeCallback），' +
+            '已降级为手动模式：请直接点击页面上的「view all」加载剩余条目');
+        renderStatus();
+      }
+    }, true);
+  }
 
   // 全库（年份缓存）中落在 [from, to] 区间的条目数
   function countInCache(from, to) {
@@ -1196,6 +1218,14 @@
       if (el.querySelector(CFG.itemSelector)) continue;           // 排除装着条目的大容器
       if (t.length < bestLen) { best = el; bestLen = t.length; }  // 取文本最短的（最内层）
     }
+    if (best) {
+      log('找到 view all 元素：', best.tagName,
+          'class="' + (best.className || '') + '"',
+          'id="' + (best.id || '') + '"',
+          'text="' + (best.textContent || '').trim().slice(0, 40) + '"');
+    } else {
+      log('未找到 view all 元素（scope=' + (scope.id || scope.tagName) + '）');
+    }
     return best;
   }
 
@@ -1203,10 +1233,25 @@
     const el = findViewAllEl();
     if (!el) return false;
     try {
-      el.click();
+      // 优先用 jQuery trigger（Bandcamp 的 view-all 绑定多在 jQuery 上，
+      // 原生 el.click() 的合成事件可能缺少 handler 期望的属性导致 completeCallback 丢失）
+      if (W.jQuery && W.jQuery.fn && W.jQuery.fn.trigger) {
+        W.jQuery(el).trigger('click');
+      } else if (typeof W.MouseEvent === 'function') {
+        // fallback：dispatchEvent 模拟完整的鼠标事件序列，比 el.click() 更接近真实点击
+        const opts = { bubbles: true, cancelable: true, view: W };
+        el.dispatchEvent(new W.MouseEvent('mousedown', opts));
+        el.dispatchEvent(new W.MouseEvent('mouseup', opts));
+        el.dispatchEvent(new W.MouseEvent('click', opts));
+      } else {
+        el.click();
+      }
       log('已触发页面「view all」以加载全部条目');
       return true;
-    } catch (e) { return false; }
+    } catch (e) {
+      log('触发 view all 失败：', e && e.message);
+      return false;
+    }
   }
 
   function scrollToBottom() {
@@ -1232,11 +1277,10 @@
     autoLoad.loaded = have;
     autoLoad.rounds = 0;
     autoLoad.stalled = 0;
-    log('所选年份在页面尚未全部渲染，自动加载条目：', have, '/', want);
 
     // 关键修复：先把过滤隐藏的 li 全部恢复显示，再用 rootEl 整体 visibility:hidden
     // 让用户看不到"一闪而过"，但 li 的 display 仍是 block，Bandcamp 的 :visible
-    // 选择器能正常扫描到条目，view all 的 ajax 完成回调不会走 reject 错分支。
+    // 选择器能正常扫描到条目。
     const restoreLoading = rootEl && !rootEl.classList.contains('bc-yf-loading');
     if (restoreLoading) rootEl.classList.add('bc-yf-loading');
     const hiddenLis = rootEl
@@ -1244,8 +1288,17 @@
       : [];
     if (hiddenLis.length) hiddenLis.forEach(li => li.classList.remove('bc-yf-hidden'));
 
+    // degraded 模式：检测到 completeCallback 报错后不再自动点 view all，
+    // 只监听 DOM 变化（用户手动点 view all 后新 li 会被 MutationObserver 捕获）
+    const canAutoClick = !autoLoad.degraded;
+    if (canAutoClick) {
+      log('所选年份在页面尚未全部渲染，自动加载条目：', have, '/', want);
+    } else {
+      log('所选年份在页面尚未全部渲染（手动模式），请点击 Bandcamp 的「view all」：', have, '/', want);
+    }
+
     try {
-      if (clickViewAll()) {
+      if (canAutoClick && clickViewAll()) {
         await sleep(CFG.autoLoadRoundDelay);
         if (rootEl) scan(rootEl);
         // 注意：这里不调 applyFilter()——autoLoad.running 期间 applyFilter 已被短路，
@@ -1267,7 +1320,8 @@
 
         if (items.size === lastCount) {
           autoLoad.stalled++;
-          if (autoLoad.stalled === 1) clickViewAll();   // 停滞时再点一次，某些版本需多次触发
+          // 停滞时再点一次（仅未降级时；degraded 模式下靠用户手动点）
+          if (canAutoClick && autoLoad.stalled === 1) clickViewAll();
           if (autoLoad.stalled >= CFG.autoLoadStableRounds) break;
         } else {
           autoLoad.stalled = 0;
@@ -1329,9 +1383,14 @@
     // 按需加载：选中年份后正在把未渲染的条目加载出来
     if (autoLoad.running) {
       const totalHint = roster.total || items.size;
-      parts.push(`加载条目 ${items.size}/${totalHint}（目标年份 ${autoLoad.loaded}/${autoLoad.want}）`);
+      if (autoLoad.degraded) {
+        parts.push(`请点击「view all」加载条目（目标年份 ${autoLoad.loaded}/${autoLoad.want}）`);
+        ui.status.title = '自动点击 view all 触发 Bandcamp 报错，已改为手动模式：请直接点击页面上的「view all」按钮';
+      } else {
+        parts.push(`加载条目 ${items.size}/${totalHint}（目标年份 ${autoLoad.loaded}/${autoLoad.want}）`);
+        ui.status.title = '正在让 Bandcamp 加载更多条目，以便显示所选年份的专辑';
+      }
       ui.status.style.opacity = '1';
-      ui.status.title = '正在让 Bandcamp 加载更多条目，以便显示所选年份的专辑';
     } else if (autoLoad.want && autoLoad.loaded < autoLoad.want) {
       // 加载结束仍不够：告诉用户剩下的要手动点 view all（Bandcamp 自身限制）
       parts.push(`该年份 ${autoLoad.loaded}/${autoLoad.want} 张已在页面，其余请点「view all」`);
