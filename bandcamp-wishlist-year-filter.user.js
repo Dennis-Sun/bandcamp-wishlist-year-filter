@@ -2,7 +2,7 @@
 // @name         Bandcamp Wishlist Year Filter
 // @name:zh-CN   Bandcamp 收藏夹年份过滤器
 // @namespace    https://bandcamp.com/
-// @version      1.3.7
+// @version      1.3.8
 // @description  Add a release-year filter next to the wishlist search box on Bandcamp wishlist pages
 // @description:zh-CN  在 Bandcamp 收藏夹（wishlist）页面搜索框右侧添加「发行年份」过滤器
 // @author       WorkBuddy
@@ -76,6 +76,14 @@
  *     修法：循环里只 sleep + scan + 计数，不再滚动，让 view all 自己加载完。
  *     scrollToBottom 保留为工具函数但不再调用；autoLoadStableRounds 3→8，
  *     避免 Bandcamp 分页间隔被误判为停滞。
+ * 4i. v1.3.8 起：**真正的最终病根** —— 不能用 display:none 隐藏 li。
+ *     实测即使脚本已降级为手动模式（不再自动点 view all），用户手动点 view all
+ *     后依然报 completeCallback：因为页面上的 li 早已被我们用 display:none
+ *     隐藏，Bandcamp 的 ajax 完成回调扫 jQuery :visible（offsetWidth>0）
+ *     选不到任何条目 → reject 但 completeCallback 未设 → 抛错。
+ *     修法：bc-yf-hidden 改用「height:0 + opacity:0 + overflow:hidden」，
+ *     用户看不到、不占布局空间，但 offsetWidth 仍 > 0，:visible 照常匹配，
+ *     Bandcamp 的加载回调不再走错分支。
  * 5. 所有出站请求统一经过限流器（默认 2 次/秒 + 滑动窗口）；一旦收到 429 就整体冷却，
  *    按 8s→16s→…→120s 指数退避（优先采用响应头的 Retry-After），冷却期间状态栏倒计时提示，
  *    冷却结束后自动重试。被限流导致失败的条目不会写入缓存，避免被永久误判为「无年份」。
@@ -1488,7 +1496,19 @@
         border:1px solid rgba(128,128,128,.55);background:rgba(128,128,128,.14);color:inherit;}
       .bc-year-filter button:hover{background:rgba(128,128,128,.28);}
       .bc-year-filter .bc-yf-status{margin-left:4px;font-size:12px;opacity:.65;font-variant-numeric:tabular-nums;}
-      li.collection-item-container.bc-yf-hidden{display:none !important;}
+      /* 必须用「高度归零 + opacity:0」而不是 display:none！
+         Bandcamp 的 view all / 滚动分页 ajax 完成回调会用 jQuery :visible
+         扫描已渲染条目；一旦用 display:none 把 li 全部隐藏，
+         offsetWidth 变 0 → :visible 选不到 → handler 走 reject 分支但
+         completeCallback 未设 → 抛 "e.completeCallback is not a function"。
+         高度归零不占布局空间，但 offsetWidth 仍 > 0，:visible 照常匹配。 */
+      li.collection-item-container.bc-yf-hidden{
+        height:0 !important;min-height:0 !important;max-height:0 !important;
+        overflow:hidden !important;opacity:0 !important;
+        padding-top:0 !important;padding-bottom:0 !important;
+        margin-top:0 !important;margin-bottom:0 !important;
+        border-top-width:0 !important;border-bottom-width:0 !important;
+        pointer-events:none !important;}
       /* 自动加载期间整体隐藏（visibility 而非 display），让 Bandcamp 的 :visible 仍能选到 li */
       .bc-yf-loading{visibility:hidden !important;}
       .bc-year-badge{position:absolute;right:4px;bottom:4px;padding:1px 5px;border-radius:3px;
