@@ -2,7 +2,7 @@
 // @name         Bandcamp Wishlist Year Filter
 // @name:zh-CN   Bandcamp 收藏夹年份过滤器
 // @namespace    https://bandcamp.com/
-// @version      1.3.5
+// @version      1.3.6
 // @description  Add a release-year filter next to the wishlist search box on Bandcamp wishlist pages
 // @description:zh-CN  在 Bandcamp 收藏夹（wishlist）页面搜索框右侧添加「发行年份」过滤器
 // @author       WorkBuddy
@@ -62,6 +62,12 @@
  *     - findViewAllEl 增加调试日志，输出找到的元素 tag/class/id/text 便于诊断。
  *     - 全局 error 监听捕获 completeCallback 报错后自动降级为「手动模式」：
  *       不再自动点 view all，状态栏提示用户手动点击，避免反复报错。
+ * 4g. v1.3.6 起：修复 findViewAllEl 点到外层容器导致 completeCallback 报错。
+ *     实测 Bandcamp 的 view all 是 <div class="expand-container show-button">
+ *     包裹内部 <button>，click handler 绑定在内部 button 上；点外层 div 时
+ *     event.target 不对，handler 走错分支 reject Deferred 但 completeCallback
+ *     未设 → 抛 "e.completeCallback is not a function"。修法：找到容器后
+ *     继续 querySelector('button, a, [role="button"]') 返回内部可点击元素。
  * 5. 所有出站请求统一经过限流器（默认 2 次/秒 + 滑动窗口）；一旦收到 429 就整体冷却，
  *    按 8s→16s→…→120s 指数退避（优先采用响应头的 Retry-After），冷却期间状态栏倒计时提示，
  *    冷却结束后自动重试。被限流导致失败的条目不会写入缓存，避免被永久误判为「无年份」。
@@ -1218,14 +1224,26 @@
       if (el.querySelector(CFG.itemSelector)) continue;           // 排除装着条目的大容器
       if (t.length < bestLen) { best = el; bestLen = t.length; }  // 取文本最短的（最内层）
     }
-    if (best) {
-      log('找到 view all 元素：', best.tagName,
-          'class="' + (best.className || '') + '"',
-          'id="' + (best.id || '') + '"',
-          'text="' + (best.textContent || '').trim().slice(0, 40) + '"');
-    } else {
+    if (!best) {
       log('未找到 view all 元素（scope=' + (scope.id || scope.tagName) + '）');
+      return null;
     }
+    // Bandcamp 的 view all 常是 <div class="expand-container"><button>view all N items</button></div>
+    // click handler 绑定在内部 button/a 上，点外层 div 时 event.target 不对会走错分支
+    // （reject Deferred 但 completeCallback 未设）。优先返回容器内部的可点击元素。
+    if (best.tagName === 'DIV' || best.tagName === 'SPAN' || best.tagName === 'LI' || best.tagName === 'P') {
+      const inner = best.querySelector('button, a, [role="button"], input[type="button"], input[type="submit"]');
+      if (inner) {
+        log('view all 容器内找到可点击元素：', inner.tagName,
+            'class="' + (inner.className || '') + '"',
+            'text="' + (inner.textContent || inner.value || '').trim().slice(0, 40) + '"');
+        return inner;
+      }
+    }
+    log('找到 view all 元素：', best.tagName,
+        'class="' + (best.className || '') + '"',
+        'id="' + (best.id || '') + '"',
+        'text="' + (best.textContent || '').trim().slice(0, 40) + '"');
     return best;
   }
 
