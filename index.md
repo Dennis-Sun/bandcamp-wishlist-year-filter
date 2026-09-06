@@ -56,11 +56,15 @@ Bandcamp 的收藏夹页面默认不显示发行日期，收藏多了以后很�
 
 ### 版本
 
-当前版本 **v1.3.4**。
+当前版本 **v1.3.8**。
 
 ### 版本日志
 
-- **v1.3.4**（2026-09）：修复 v1.3.3 引入的「view all 加载不出结果 + 控制台报 `e.completeCallback is not a function`」。根因：v1.3.3 的 `applyFilter` 用 `display:none` 把非选中 li 全部隐藏，Bandcamp 的 view all ajax 完成回调基于 jQuery `:visible` 扫描已渲染条目时发现"全部不可见"，走到 reject 分支但 `completeCallback` 未设 → 抛错。修法：autoLoad 期间用 rootEl 的 `visibility:hidden` 整体隐藏（li 的 display 仍为 block，Bandcamp 的 `:visible` 仍能选到），`applyFilter` 顶部加 `autoLoad.running` 守卫短路所有路径的隐藏；加载完毕由 `finally` 一次性 `applyFilter`。
+- **v1.3.8**（2026-09）：**修复「view all 加载不出结果」的最终病根**。此前用 `display:none` 隐藏被过滤的 li，而 Bandcamp 的 view all / 滚动分页 ajax 完成回调用 jQuery `:visible`（判据 `offsetWidth > 0`）扫描已渲染条目——全部不可见时一个都选不到，走到 reject 分支但 `completeCallback` 未设 → 抛 `e.completeCallback is not a function`，新 li 也不插入 DOM。现改为 `height:0 + opacity:0 + overflow:hidden`：用户看不到、不占布局空间，但 `offsetWidth` 仍 > 0，`:visible` 照常匹配。
+- **v1.3.7**（2026-09）：停止在自动加载循环里 `scrollToBottom()`。Bandcamp 点 view all 后会自己分页加载完，我们再滚动到底会额外触发 `onScroll → paginate → getItems`，两条并发加载流打架导致同样的报错。改为纯轮询等待。
+- **v1.3.6**（2026-09）：`findViewAllEl` 改为钻取 `div.expand-container` **内部的** `<button>`/`<a>`——click handler 绑定在内部元素上，点外层 div 时 `event.target` 不对会走错分支。
+- **v1.3.5**（2026-09）：view all 触发方式加固（优先 jQuery `trigger`，其次 `dispatchEvent` 模拟完整鼠标序列）；新增报错自动降级——检测到 `completeCallback` 报错后切换为手动模式，状态栏提示用户手动点击。
+- **v1.3.4**（2026-09）：autoLoad 期间改用 rootEl 的 `visibility:hidden` 整体隐藏，`applyFilter` 顶部加 `autoLoad.running` 守卫。
 - **v1.3.3**（2026-09）：修复「切到非最晚年份后页面为空」——脚本检测到所选年份在 DOM 里没渲染全时，会自动触发 Bandcamp 自带的「view all + 滚动懒加载」把剩余 li 拉进 DOM，原解析缓存即时落到新条目上，无需额外网络请求。
 - **v1.3.2**：发行年份下拉菜单改为从全库解析缓存 `store.data` 取值，而不仅是当前 DOM 中的 20 张专辑；自此刷新页面后台也能持续推进。
 - **v1.3.1** 起加上自愈、watchdog 与「重建清单」按钮，稳固大列表场景。
@@ -72,7 +76,7 @@ Bandcamp 的收藏夹页面默认不显示发行日期，收藏多了以后很�
 1. 登录 Bandcamp，打开你自己的收藏夹页面，例如 `https://bandcamp.com/<用户名>/wishlist`；
 2. 页面加载后，搜索框右侧会出现「发行年份」过滤器控件；
 3. **按年份过滤**：在左侧下拉选择起始年份（含），右侧选择结束年份（含），页面条目即时过滤；点「重置」清除过滤；
-4. **自动补全条目**：选了非最晚年份后，状态栏出现「加载条目 N/M（目标年份 x/y）」——脚本正在自动触发 Bandcamp 自带的「view all + 滚动懒加载」把页面里没渲染出来的 li 拉进来，新 li 直接读取已缓存的年份，不会重复请求远端。点「重置」会立即取消自动加载；
+4. **自动补全条目**：选了非最晚年份后，状态栏出现「加载条目 N/M（目标年份 x/y）」——脚本会自动点击 Bandcamp 的「view all」把页面里没渲染出来的 li 加载进来，然后**等待它自己加载完**（不再主动滚动，避免与 Bandcamp 自身的分页加载冲突）。新 li 直接读取已缓存的年份，不会重复请求远端。加载期间若仍不够，状态栏会提示你手动点一下「view all」；
 5. **等待全库解析**：状态栏显示「全库 N/M」实时进度。后台会以约 2 条/秒的速度逐条补齐年份并即时落盘。**不用一直开着页面等**——随时刷新或关闭，下次打开会自动续跑；
 6. 想立刻看到更早年代的年份出现在下拉菜单里？无需手动加载全部条目，后台解析完自然就会出现——两个下拉框的选项**跟随全库解析进度动态刷新**；
 7. 遇到异常可手动干预：
