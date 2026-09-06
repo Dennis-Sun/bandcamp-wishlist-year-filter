@@ -2,7 +2,7 @@
 // @name         Bandcamp Wishlist Year Filter
 // @name:zh-CN   Bandcamp 收藏夹年份过滤器
 // @namespace    https://bandcamp.com/
-// @version      1.3.2
+// @version      1.3.3
 // @description  Add a release-year filter next to the wishlist search box on Bandcamp wishlist pages
 // @description:zh-CN  在 Bandcamp 收藏夹（wishlist）页面搜索框右侧添加「发行年份」过滤器
 // @author       WorkBuddy
@@ -41,6 +41,12 @@
  *     - 看门狗定时巡检，停滞超过 rosterIdleRestartMs 强制重启一轮。
  *     - 工具栏新增「重建清单」按钮：丢弃旧 roster（保留年份缓存）从零重拉，
  *       旧 worker 通过 generation 自增自行退出；DOM 占位条目立即开工。
+ * 4d. v1.3.3 起：过滤也能作用于全库（按需加载）。
+ *     解析早已全库化，但过滤只能作用于当前 DOM 渲染出来的 li；页面默认只有 20 个，
+ *     于是选中一个页面里还没出现的年份时这 20 条全被隐藏，看起来就像「内容空了」。
+ *     现在选中年份后会比对「缓存里该区间的条目数」与「页面已渲染的匹配数」，
+ *     不足时自动触发页面的 view all / 滚动懒加载把条目加载出来；新 li 的年份
+ *     直接从 store.data 回填（已解析过的不产生网络请求）。
  * 5. 所有出站请求统一经过限流器（默认 2 次/秒 + 滑动窗口）；一旦收到 429 就整体冷却，
  *    按 8s→16s→…→120s 指数退避（优先采用响应头的 Retry-After），冷却期间状态栏倒计时提示，
  *    冷却结束后自动重试。被限流导致失败的条目不会写入缓存，避免被永久误判为「无年份」。
@@ -80,7 +86,12 @@
     rosterPartialMaxAge: 30 * 1000,      // 「不完整清单」隔多久再续拉一次
     rosterMaxPages: 400,                 // 单次续拉的翻页上限
     rosterMaxAttempts: 4,                // 单条在一轮里最多重试几次（被限流时）
-    rosterIdleRestartMs: 25000           // 后台解析停滞多久后判定卡死并重启
+    rosterIdleRestartMs: 25000,          // 后台解析停滞多久后判定卡死并重启
+    // —— 按需加载条目（让「过滤」也能作用于全库，而不只是当前渲染的 20 个 li）——
+    autoLoadOnFilter: true,              // 选中年份后自动把未渲染的条目加载出来
+    autoLoadMaxRounds: 40,               // 自动加载最多循环几轮
+    autoLoadRoundDelay: 700,             // 每轮等待多久让 Bandcamp 渲染(ms)
+    autoLoadStableRounds: 3              // 连续几轮条目数没增长就判定加载完毕
   };
 
   const TAG = '[BC-YearFilter]';
@@ -1110,6 +1121,144 @@
     renderStatus();
   }
 
+  /* ==================== 按需加载（让过滤作用于全库） ==================== */
+  /*
+   * 问题：解析已经全库化（store.data 里有 1238 条的年份），但过滤只能作用于
+   * 当前 DOM 里渲染出来的 li。页面默认只渲染 20 个，于是选中一个页面里
+   * 还没出现的年份时，这 20 条全被隐藏 —— 看起来就是「内容空了」。
+   *
+   * 解决：选中年份后，如果缓存里该区间的条目数 > 页面已渲染的匹配数，
+   * 就自动触发 Bandcamp 的「view all」/ 滚动懒加载把条目加载出来。
+   * 新出现的 li 会被 MutationObserver + scan() 捕获，年份直接从 store.data
+   * 回填（已解析过的条目不产生任何网络请求）。
+   */
+  const autoLoad = {
+    running: false,
+    cancelled: false,
+    want: 0,      // 缓存里该区间应有的条目数
+    loaded: 0,    // 当前 DOM 中已渲染且匹配区间的条目数
+    rounds: 0,
+    stalled: 0
+  };
+
+  // 全库（年份缓存）中落在 [from, to] 区间的条目数
+  function countInCache(from, to) {
+    let n = 0;
+    for (const v of Object.values(store.data)) {
+      const y = v && v.year;
+      if (typeof y !== 'number') continue;
+      if ((from == null || y >= from) && (to == null || y <= to)) n++;
+    }
+    return n;
+  }
+
+  // 当前 DOM 中已渲染且落在 [from, to] 区间的条目数
+  function countInDom(from, to) {
+    let n = 0;
+    for (const rec of items.values()) {
+      if (!rec.node.isConnected) continue;
+      if (rec.year == null) continue;
+      if ((from == null || rec.year >= from) && (to == null || rec.year <= to)) n++;
+    }
+    return n;
+  }
+
+  // 模糊查找页面上的「view all」元素（Bandcamp 各版本写法不一，用文本匹配兜底）
+  function findViewAllEl() {
+    if (!doc || !doc.getElementById || !doc.querySelectorAll) return null;
+    const scope =
+      doc.getElementById(CFG.target + '-grid') ||
+      doc.getElementById(CFG.target + '-items-container') ||
+      rootEl || doc.body;
+    if (!scope || !scope.querySelectorAll) return null;
+    let best = null;
+    let bestLen = Infinity;
+    const cands = scope.querySelectorAll('a, button, span, div, li, p');
+    for (const el of cands) {
+      if (el.closest && el.closest('.bc-year-filter')) continue;  // 排除自己的控件
+      const t = (el.textContent || '').trim();
+      if (!t || t.length > 60) continue;
+      if (!/view\s*all/i.test(t)) continue;
+      if (el.querySelector(CFG.itemSelector)) continue;           // 排除装着条目的大容器
+      if (t.length < bestLen) { best = el; bestLen = t.length; }  // 取文本最短的（最内层）
+    }
+    return best;
+  }
+
+  function clickViewAll() {
+    const el = findViewAllEl();
+    if (!el) return false;
+    try {
+      el.click();
+      log('已触发页面「view all」以加载全部条目');
+      return true;
+    } catch (e) { return false; }
+  }
+
+  function scrollToBottom() {
+    try {
+      if (doc.body) W.scrollTo(0, doc.body.scrollHeight);
+    } catch (e) { /* ignore */ }
+  }
+
+  // 选中年份后，把尚未渲染的条目加载出来（幂等：重复调用不会叠加）
+  async function autoExpandForFilter() {
+    if (!CFG.autoLoadOnFilter || autoLoad.running) return;
+    const [from, to] = getRange();
+    if (from == null && to == null) return;      // 没选年份，不需要加载
+
+    const want = countInCache(from, to);
+    if (!want) return;                            // 全库该区间本来就没有条目
+    let have = countInDom(from, to);
+    if (have >= want) return;                     // 页面已经加载够了
+
+    autoLoad.running = true;
+    autoLoad.cancelled = false;
+    autoLoad.want = want;
+    autoLoad.loaded = have;
+    autoLoad.rounds = 0;
+    autoLoad.stalled = 0;
+    log('所选年份在页面尚未全部渲染，自动加载条目：', have, '/', want);
+
+    try {
+      if (clickViewAll()) {
+        await sleep(CFG.autoLoadRoundDelay);
+        if (rootEl) scan(rootEl);
+        applyFilter();
+      }
+
+      let lastCount = items.size;
+      for (let i = 0; i < CFG.autoLoadMaxRounds; i++) {
+        if (autoLoad.cancelled) break;
+        autoLoad.rounds++;
+
+        scrollToBottom();                         // 触发懒加载
+        await sleep(CFG.autoLoadRoundDelay);
+        if (rootEl) scan(rootEl);
+        applyFilter();
+        autoLoad.loaded = countInDom(from, to);
+        renderStatus();
+
+        if (autoLoad.loaded >= want) break;        // 已经够显示
+
+        if (items.size === lastCount) {
+          autoLoad.stalled++;
+          if (autoLoad.stalled === 1) clickViewAll();   // 停滞时再点一次，某些版本需多次触发
+          if (autoLoad.stalled >= CFG.autoLoadStableRounds) break;
+        } else {
+          autoLoad.stalled = 0;
+          lastCount = items.size;
+        }
+      }
+      log('自动加载结束：页面匹配', countInDom(from, to), '/ 全库', want);
+    } catch (e) {
+      log('自动加载条目出错：', e && e.message);
+    } finally {
+      autoLoad.running = false;
+      renderStatus();
+    }
+  }
+
   function renderStatus() {
     if (!ui) return;
     const parts = [];
@@ -1148,6 +1297,18 @@
     if (roster.running && roster.pending.length) {
       parts.push(`后台补解析中（剩 ${roster.pending.length}）`);
       ui.status.title = '后台正在补全尚未解析的条目，结果随时落盘，可随时刷新或关闭页面，下次自动继续';
+    }
+
+    // 按需加载：选中年份后正在把未渲染的条目加载出来
+    if (autoLoad.running) {
+      const totalHint = roster.total || items.size;
+      parts.push(`加载条目 ${items.size}/${totalHint}（目标年份 ${autoLoad.loaded}/${autoLoad.want}）`);
+      ui.status.style.opacity = '1';
+      ui.status.title = '正在让 Bandcamp 加载更多条目，以便显示所选年份的专辑';
+    } else if (autoLoad.want && autoLoad.loaded < autoLoad.want) {
+      // 加载结束仍不够：告诉用户剩下的要手动点 view all（Bandcamp 自身限制）
+      parts.push(`该年份 ${autoLoad.loaded}/${autoLoad.want} 张已在页面，其余请点「view all」`);
+      ui.status.title = '页面没有渲染出全部条目，点 Bandcamp 的「view all」后会自动补上';
     }
     ui.status.textContent = parts.join(' · ');
   }
@@ -1280,11 +1441,20 @@
       _sig: ''
     };
 
-    ui.from.addEventListener('change', applyFilter);
-    ui.to.addEventListener('change', applyFilter);
+    // 选完年份先按现有条目过滤，再把尚未渲染的条目加载出来（否则页面只剩 20 条时
+    // 选中一个页面里没有的年份会「全部隐藏」= 看起来内容空了）
+    const onRangeChange = () => {
+      applyFilter();
+      autoExpandForFilter();
+    };
+    ui.from.addEventListener('change', onRangeChange);
+    ui.to.addEventListener('change', onRangeChange);
     ui.reset.addEventListener('click', () => {
       ui.from.value = '';
       ui.to.value = '';
+      autoLoad.cancelled = true;
+      autoLoad.want = 0;
+      autoLoad.loaded = 0;
       applyFilter();
     });
     ui.clear.addEventListener('click', () => {
